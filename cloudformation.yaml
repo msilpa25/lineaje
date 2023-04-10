@@ -1,0 +1,195 @@
+Resources:
+  # ECS Cluster
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: ecs-tasks
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+
+  ECSCluster:
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: my-ecs-cluster
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for my ALB
+      VpcId: "vpc-0a8abc9c3dcb82b44"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for my EC2
+      VpcId: "vpc-0a8abc9c3dcb82b44"
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+
+  # ECS Task Definition
+  ECSTaskDefinition:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      Family: "my-ecs-task"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: 073515860795.dkr.ecr.ap-southeast-2.amazonaws.com/my-registry:latest
+          Memory: 256
+          Cpu: 256
+          PortMappings:
+            - ContainerPort: 80
+
+  # Auto Scaling Group for ECS Instances
+  EC2AutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      VPCZoneIdentifier:
+        - subnet-047827ee7c332dc08
+        - subnet-0307bb40cb2d77864
+      MinSize: 1
+      MaxSize: 10
+      DesiredCapacity: 1
+      LaunchConfigurationName:
+        Ref: "EC2LaunchConfig"
+      Tags:
+        - Key: "Name"
+          Value: "my-ecs-instances"
+          PropagateAtLaunch: true
+
+  # Launch Configuration for ECS Instances
+  EC2LaunchConfig:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Properties:
+      ImageId: "ami-0a0e3bf505e8e5762"
+      InstanceType: "t2.micro"
+      KeyName: "my-key"
+      SecurityGroups:
+        - !Ref EC2SecurityGroup
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          echo ECS_CLUSTER=my-ecs-cluster >> /etc/ecs/ecs.config
+      IamInstanceProfile: "ecsInstanceRole"
+
+  # Elastic Load Balancer
+  ELB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: my-alb
+      Scheme: internet-facing
+      Subnets:
+        - subnet-047827ee7c332dc08
+        - subnet-0307bb40cb2d77864
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: my-alb
+
+  # ECS Service
+  ECSService:
+    Type: "AWS::ECS::Service"
+    DependsOn:
+    - MyListener
+    Properties:
+      Cluster:
+        Ref: "ECSCluster"
+      DesiredCount: 1
+      TaskDefinition:
+        Ref: "ECSTaskDefinition"
+      LoadBalancers:
+        - ContainerName: "web"
+          ContainerPort: 80
+          TargetGroupArn: !Ref ECSTargetGroup
+  MyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ELB
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ECSTargetGroup
+  
+  ECSTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: my-ecs-target-group
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: vpc-0a8abc9c3dcb82b44
+
+  # API Gateway
+  MyApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: my-api-gateway
+
+  # Define the API Gateway resource
+  MyApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MyApiGateway
+      ParentId: !GetAtt [MyApiGateway, RootResourceId]
+      PathPart: my-resource
+
+  # Define the API Gateway method
+  MyApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MyApiGateway
+      ResourceId: !Ref MyApiGatewayResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: HTTP_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "http://${ELB.DNSName}"
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestParameters:
+          integration.request.header.X-Forwarded-Proto: "'https'"
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: '{}'
+            ResponseParameters:
+              method.response.header.Content-Type: "'application/json'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Content-Type: true
+     
+
